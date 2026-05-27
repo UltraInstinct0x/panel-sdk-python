@@ -1,28 +1,52 @@
 # panel-sdk (python)
 
-thin client for [panel](https://github.com/UltraInstinct0x/panel). python 3.10+.
+Thin client for [panel](https://github.com/UltraInstinct0x/panel). Python 3.10+.
 
-```
+## Install
+
+```bash
 pip install panel-sdk
 ```
+
+## v0.2.0 options
 
 ```python
 from panel_sdk import PanelClient
 
 panel = PanelClient(
     base_url="https://panel.example.com",
-    site_key=os.environ["PANEL_SITE_KEY"],
-    site_secret=os.environ["PANEL_SITE_SECRET"],
-    scrubber_secret=os.environ.get("SCRUBBER_JWT_SECRET"),  # omit for first-party keys
+    site_key="pk_live_xxx",
+    site_secret="secret",
+    site_secret_source="env",  # or "raw" for dual-secret mode
+    scrubber_mode="off",  # off | self-sign | proxy
+    scrubber_secret=None,  # required when scrubber_mode="self-sign"
+    scrubber_url=None,  # required when scrubber_mode="proxy"
+    engine_version="0.2.0",
+    timeout_seconds=10.0,
+    max_retries=3,
 )
-
-v = panel.verify_token(request.json["panel_token"])
-if not v.ok or (v.trust or 0) < 0.5:
-    abort(403)
-
-panel.ingest_trace(trace_id=f"tr_{uuid4()}", source_agent="myapp",
-                   blob={"messages": [...]})
 ```
 
-methods (sync + async via `AsyncPanelClient`): `ingest_unit`, `ingest_trace`, `verify_token`, `fetch_unit`, `fetch_trace`.
-auth: HMAC-SHA256 (`x-panel-ingest-sig`) + optional scrubber JWT.
+## PanelClient methods
+
+- `ingest_trace(source_agent, blob, trace_id=None) -> TraceResult`
+- `ingest_trace_and_wait(source_agent, blob, trace_id=None, max_wait_seconds=60, poll_interval_seconds=1.5) -> dict`
+- `fetch_trace(trace_id) -> dict`
+- `ingest_units(units) -> dict`
+- `score_unit(ref=None, unit_id=None) -> dict`
+- `skill_review(skill_name, diff, ...) -> dict`
+- `verify_token(token) -> VerifyResult`
+
+`verify_token(token)` signature remains unchanged.
+
+## Rater clients
+
+- `RaterClient.next_unit(pool, rater_id)`
+- `RaterClient.submit_judgment(unit_id, choice)`
+- Async parity via `AsyncRaterClient`
+
+## Errors
+
+- `PanelError`
+- `PanelRateLimitError` (includes `scope`, `retry_after_s`)
+- `PanelScrubberError`
