@@ -7,7 +7,7 @@ import httpx
 import pytest
 import respx
 
-from panel_sdk import PanelClient, PanelRateLimitError, TraceResult
+from panel_sdk import AsyncPanelClient, PanelClient
 
 BASE = "https://p.test"
 SITE_KEY = "pk_test_sdk"
@@ -15,111 +15,117 @@ SITE_SECRET = "site-secret-abc"
 SCRUBBER_SECRET = "scrubber-secret-xyz"
 
 
-def test_hmac_signature_for_ingest_body() -> None:
-    seen: dict[str, str | None] = {}
-
-    @respx.mock
-    def run() -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen["sig"] = request.headers.get("x-panel-ingest-sig")
-            body = request.content.decode("utf-8")
-            expected = hmac.new(SITE_SECRET.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
-            assert seen["sig"] == expected
-            return httpx.Response(200, json={"ok": True})
-
-        respx.post(f"{BASE}/api/units/ingest").mock(side_effect=handler)
-        client = PanelClient(base_url=BASE, site_key=SITE_KEY, site_secret=SITE_SECRET)
-        client.ingest_units({"type": "process_output_rating", "passage": "hello"})
-
-    run()
-
-
 @respx.mock
-def test_hmac_signature_for_score_canonical_query() -> None:
-    seen: dict[str, str | None] = {}
+def test_ingest_unit_hmac_uses_exact_body_bytes() -> None:
+    seen: dict[str, str | bytes | None] = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def ingest_handler(request: httpx.Request) -> httpx.Response:
         seen["sig"] = request.headers.get("x-panel-ingest-sig")
-        return httpx.Response(200, json={"counts": {"yes": 1}, "trust_weighted_score": 0.8})
+        seen["body"] = request.content
+        expected = hmac.new(SITE_SECRET.encode("utf-8"), request.content, hashlib.sha256).hexdigest()
+        assert seen["sig"] == expected
+        return httpx.Response(200, json={"id": "u_1"})
 
-    respx.get(f"{BASE}/api/units/score").mock(side_effect=handler)
+    respx.post(f"{BASE}/api/units/ingest").mock(side_effect=ingest_handler)
     client = PanelClient(base_url=BASE, site_key=SITE_KEY, site_secret=SITE_SECRET)
-    client.score_unit(ref="ext_123")
-    canonical = f"GET\n/api/units/score\nref=ext_123\nid=\nsite={SITE_KEY}"
-    expected = hmac.new(SITE_SECRET.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
-    assert seen["sig"] == expected
+    out = client.ingest_unit("process_output_rating", {"passage": "hello"})
+    assert out["id"] == "u_1"
+    assert seen["body"] == b'{"type":"process_output_rating","pool":"public","payload":{"passage":"hello"}}'
 
 
 @respx.mock
-def test_scrubber_self_sign_jwt_structure() -> None:
-    seen: dict[str, str] = {}
+def test_ingest_unit_scrubber_text_adds_attestation() -> None:
+    seen: dict[str, str | bytes | None] = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["token"] = request.headers["x-scrubber-attestation"]
-        seen["body"] = request.content.decode("utf-8")
-        return httpx.Response(200, json={"trace_id": "tr_1", "unit_ids": [], "structural_count": 1, "llm_count": 0, "skipped_count": 0})
+    respx.post("https://s.test/v1/scrub").mock(return_value=httpx.Response(200, json={"scrubbed": "clean text"}))
 
-    respx.post(f"{BASE}/api/v1/traces").mock(side_effect=handler)
+    def ingest_handler(request: httpx.Request) -> httpx.Response:
+        seen["att"] = request.headers.get("x-scrubber-attestation")
+        seen["body"] = request.content
+        return httpx.Response(200, json={"id": "u_2", "unit_ids": ["u_2"]})
+
+    respx.post(f"{BASE}/api/units/ingest").mock(side_effect=ingest_handler)
     client = PanelClient(
         base_url=BASE,
         site_key=SITE_KEY,
         site_secret=SITE_SECRET,
-        scrubber_mode="self-sign",
         scrubber_secret=SCRUBBER_SECRET,
+        scrubber_url="https://s.test",
     )
-    client.ingest_trace(source_agent="agent", blob={"messages": []}, trace_id="tr_1")
-    parts = seen["token"].split(".")
-    assert len(parts) == 3
-    payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-    payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))
-    assert payload["engine_version"] == "0.2.0"
-    assert payload["mode"] == "text"
-    assert payload["output_hash"] == hashlib.sha256(seen["body"].encode("utf-8")).hexdigest()
+    out = client.ingest_unit("process_output_rating", {"passage": "x"}, scrubber_text="secret")
+    assert out["id"] == "u_2"
+    assert isinstance(seen["att"], str)
+    body_raw = seen["body"]
+    body_bytes = body_raw if isinstance(body_raw, bytes) else str(body_raw or "{}").encode("utf-8")
+    body_obj = json.loads(body_bytes.decode("utf-8"))
+    assert body_obj["payload"]["scrubber_text"] == "clean text"
 
 
 @respx.mock
-def test_ingest_trace_and_wait_completes() -> None:
-    respx.post(f"{BASE}/api/v1/traces").mock(
-        return_value=httpx.Response(202, json={"trace_id": "tr_2", "status": "pending", "poll": "/v1/traces/tr_2"})
-    )
-    route = respx.get(f"{BASE}/api/v1/traces/tr_2").mock(
-        side_effect=[
-            httpx.Response(202, json={"trace_id": "tr_2", "status": "pending"}),
-            httpx.Response(200, json={"trace_id": "tr_2", "status": "done", "unit_ids": ["u1"]}),
-        ]
-    )
+def test_ingest_trace_and_get_trace() -> None:
+    respx.post(f"{BASE}/api/v1/traces").mock(return_value=httpx.Response(202, json={"trace_id": "tr_1", "status": "pending"}))
+    respx.get(f"{BASE}/api/v1/traces/tr_1").mock(return_value=httpx.Response(200, json={"trace_id": "tr_1", "status": "done", "unit_ids": ["u1"]}))
     client = PanelClient(base_url=BASE, site_key=SITE_KEY, site_secret=SITE_SECRET)
-    result = client.ingest_trace_and_wait(source_agent="agent", blob={"messages": []}, trace_id="tr_2", max_wait_seconds=2, poll_interval_seconds=0)
-    assert result["status"] == "done"
-    assert route.call_count == 2
+    ingest = client.ingest_trace("agent-a", {"messages": []}, trace_id="tr_1")
+    assert ingest["trace_id"] == "tr_1"
+    status = client.get_trace("tr_1")
+    assert status["status"] == "done"
 
 
 @respx.mock
-def test_429_retry_after_and_then_raises() -> None:
-    route = respx.post(f"{BASE}/api/units/ingest").mock(
-        side_effect=[
-            httpx.Response(429, json={"error": "rate_limited", "scope": "ingest", "retry_after_s": 0}, headers={"Retry-After": "0"}),
-            httpx.Response(429, json={"error": "rate_limited", "scope": "ingest", "retry_after_s": 0}, headers={"Retry-After": "0"}),
-        ]
-    )
-    client = PanelClient(base_url=BASE, site_key=SITE_KEY, site_secret=SITE_SECRET, max_retries=1)
-    with pytest.raises(PanelRateLimitError) as exc:
-        client.ingest_units({"type": "process_output_rating", "passage": "x"})
-    assert exc.value.scope == "ingest"
-    assert exc.value.retry_after_s == 0.0
-    assert route.call_count == 2
+def test_submit_judgment_posts_expected_shape() -> None:
+    seen: dict[str, str] = {}
+
+    def judgment_handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = request.content.decode("utf-8")
+        return httpx.Response(200, json={"ok": True, "token": "tkn"})
+
+    respx.post(f"{BASE}/api/judgments").mock(side_effect=judgment_handler)
+    client = PanelClient(base_url=BASE, site_key=SITE_KEY, site_secret=SITE_SECRET)
+    out = client.submit_judgment(unit_id="u_1", rater_id="r_1", choice="yes", latency_ms=3000, confidence=0.8)
+    assert out["ok"] is True
+    body = json.loads(seen["body"])
+    assert body["unit_id"] == "u_1"
+    assert body["rater_id"] == "r_1"
+    assert body["choice"] == "yes"
+    assert body["latency_ms"] == 3000
+    assert body["confidence"] == 0.8
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_async_ingest_trace_returns_typed_result() -> None:
-    from panel_sdk import AsyncPanelClient
+async def test_async_methods_parity() -> None:
+    respx.post(f"{BASE}/api/units/ingest").mock(return_value=httpx.Response(200, json={"id": "u_9"}))
+    respx.post(f"{BASE}/api/v1/traces").mock(return_value=httpx.Response(200, json={"trace_id": "tr_9", "unit_ids": []}))
+    respx.get(f"{BASE}/api/v1/traces/tr_9").mock(return_value=httpx.Response(200, json={"trace_id": "tr_9", "status": "done"}))
+    respx.post(f"{BASE}/api/judgments").mock(return_value=httpx.Response(200, json={"ok": True}))
 
-    respx.post(f"{BASE}/api/v1/traces").mock(
-        return_value=httpx.Response(200, json={"trace_id": "tr_9", "unit_ids": ["u9"], "structural_count": 1, "llm_count": 1, "skipped_count": 0})
-    )
     async with httpx.AsyncClient() as session:
         client = AsyncPanelClient(base_url=BASE, site_key=SITE_KEY, site_secret=SITE_SECRET, client=session)
-        result = await client.ingest_trace(source_agent="agent", blob={"messages": []}, trace_id="tr_9")
-    assert isinstance(result, TraceResult)
-    assert result.status == "done"
+        unit = await client.ingest_unit("process_output_rating", {"passage": "hello"})
+        trace = await client.ingest_trace("agent", {"messages": []}, trace_id="tr_9")
+        status = await client.get_trace("tr_9")
+        judgment = await client.submit_judgment(unit_id="u_9", rater_id="r_9", choice="yes", latency_ms=3000)
+
+    assert unit["id"] == "u_9"
+    assert trace["trace_id"] == "tr_9"
+    assert status["status"] == "done"
+    assert judgment["ok"] is True
+
+
+def test_scrubber_attestation_jwt_shape() -> None:
+    client = PanelClient(
+        base_url=BASE,
+        site_key=SITE_KEY,
+        site_secret=SITE_SECRET,
+        scrubber_secret=SCRUBBER_SECRET,
+    )
+    token = client._scrubber_attestation("ab" * 32)
+    assert isinstance(token, str)
+    parts = token.split(".")
+    assert len(parts) == 3
+    payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))
+    assert payload["output_hash"] == "ab" * 32
+    assert payload["exp"] - payload["iat"] == 60
+    assert payload["jti"]

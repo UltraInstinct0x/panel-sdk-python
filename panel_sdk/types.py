@@ -3,7 +3,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, TypedDict
+
+
+class IngestUnitInput(TypedDict, total=False):
+    type: str
+    pool: str
+    payload: dict[str, Any]
+
+
+class IngestTraceInput(TypedDict, total=False):
+    trace_id: str
+    source_agent: str
+    blob: dict[str, Any]
+
+
+class TraceStatus(TypedDict, total=False):
+    trace_id: str
+    status: Literal["pending", "done", "error"] | str
+    unit_ids: list[str]
+    structural_count: int
+    llm_count: int
+    skipped_count: int
+    result_json: dict[str, Any] | str | None
 
 
 @dataclass

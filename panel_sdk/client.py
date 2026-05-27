@@ -1,18 +1,17 @@
-"""Panel operator clients (sync + async)."""
-
 from __future__ import annotations
 
-import asyncio
+import hashlib
+import hmac
+import json
+import secrets
 import time
-from typing import Any, Mapping
+from typing import Any, cast
 
 import httpx
 
-from panel_sdk._retry import blocking_sleep, parse_error_response, retry_delay_seconds, should_retry
-from panel_sdk._scrubber import build_scrubber_headers, build_scrubber_headers_async
-from panel_sdk._signing import canonical_json, canonical_score_string, hmac_sha256_hex
-from panel_sdk.errors import PanelRateLimitError
-from panel_sdk.types import TraceResult, VerifyResult
+from panel_sdk._retry import parse_error_response
+from panel_sdk._signing import jwt_hs256
+from panel_sdk.types import IngestTraceInput, IngestUnitInput, TraceStatus, VerifyResult
 
 
 def _json_or_raw(response: httpx.Response) -> Any:
@@ -23,169 +22,125 @@ def _json_or_raw(response: httpx.Response) -> Any:
 
 
 class PanelClient:
-    """Synchronous operator client for panel API."""
-
     def __init__(
         self,
         *,
         base_url: str,
         site_key: str,
         site_secret: str,
-        site_secret_source: str = "env",
-        scrubber_mode: str = "off",
         scrubber_secret: str | None = None,
         scrubber_url: str | None = None,
-        engine_version: str = "0.2.0",
         timeout_seconds: float = 10.0,
-        max_retries: int = 3,
         client: httpx.Client | None = None,
     ) -> None:
-        """Initialize PanelClient with server-sync options."""
         self.base_url = base_url.rstrip("/")
         self.site_key = site_key
         self.site_secret = site_secret
-        self.site_secret_source = site_secret_source
-        self.scrubber_mode = scrubber_mode
         self.scrubber_secret = scrubber_secret
         self.scrubber_url = scrubber_url
-        self.engine_version = engine_version
-        self.timeout_seconds = timeout_seconds
-        self.max_retries = max_retries
         self._client = client or httpx.Client(timeout=timeout_seconds)
 
-    def _signed_request(self, method: str, path: str, *, data: Any | None = None, params: dict[str, str] | None = None) -> Any:
-        body_obj = data if data is not None else {}
-        body = canonical_json(body_obj)
-        body, scrubber_headers = build_scrubber_headers(
-            mode=self.scrubber_mode,
-            body=body,
-            engine_version=self.engine_version,
-            scrubber_secret=self.scrubber_secret,
-            scrubber_url=self.scrubber_url,
-            client=self._client,
-            timeout_seconds=self.timeout_seconds,
-        )
+    def _sign_hmac(self, raw_body: bytes) -> str:
+        return hmac.new(self.site_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
 
-        signature = hmac_sha256_hex(self.site_secret, body)
-        if method.upper() == "GET" and path == "/api/units/score":
-            signature = hmac_sha256_hex(
-                self.site_secret,
-                canonical_score_string(self.site_key, ref=params.get("ref") if params else None, unit_id=params.get("id") if params else None),
-            )
-
-        headers: dict[str, str] = {
-            "content-type": "application/json",
-            "x-panel-site-key": self.site_key,
-            "x-panel-ingest-sig": signature,
-            **scrubber_headers,
+    def _scrubber_attestation(self, output_hash_hex: str) -> str | None:
+        if not self.scrubber_secret:
+            return None
+        now = int(time.time())
+        payload = {
+            "output_hash": output_hash_hex,
+            "iat": now,
+            "exp": now + 60,
+            "jti": secrets.token_hex(16),
         }
-        if self.site_secret_source == "raw":
-            headers["x-panel-ingest-secret"] = self.site_secret
+        return jwt_hs256(self.scrubber_secret, payload)
 
-        attempt = 0
-        while True:
-            response = self._client.request(
-                method,
-                f"{self.base_url}{path}",
-                headers=headers,
-                content=body if method.upper() != "GET" else None,
-                params=params,
-            )
-            payload = _json_or_raw(response)
-            if 200 <= response.status_code < 300:
-                return payload
-            retry_after_s: float | None = None
-            if response.status_code == 429:
-                ra = response.headers.get("Retry-After")
-                if ra:
-                    try:
-                        retry_after_s = float(ra)
-                    except ValueError:
-                        retry_after_s = None
-                if isinstance(payload, dict) and payload.get("retry_after_s") is not None:
-                    retry_after_s = float(payload["retry_after_s"])
-            if should_retry(response.status_code, attempt, self.max_retries):
-                delay = retry_delay_seconds(response.status_code, attempt, retry_after_s)
-                blocking_sleep(delay)
-                attempt += 1
-                continue
+    def _operator_post(self, path: str, body: dict[str, Any], *, attestation: str | None = None) -> dict[str, Any]:
+        raw_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "X-Panel-Site-Key": self.site_key,
+            "X-Panel-Ingest-Sig": self._sign_hmac(raw_body),
+        }
+        if attestation:
+            headers["X-Scrubber-Attestation"] = attestation
+        response = self._client.post(f"{self.base_url}{path}", headers=headers, content=raw_body)
+        payload = _json_or_raw(response)
+        if not (200 <= response.status_code < 300):
             parse_error_response(response.status_code, payload, response.text)
+        return payload
 
-    def ingest_trace(self, *, source_agent: str, blob: Mapping[str, Any], trace_id: str | None = None) -> TraceResult:
-        """Ingest a trace payload and return done/pending typed result."""
-        body: dict[str, Any] = {"source_agent": source_agent, "blob": blob}
+    def ingest_unit(
+        self,
+        type: str,
+        payload: dict[str, Any],
+        *,
+        pool: str = "public",
+        scrubber_text: str | None = None,
+    ) -> dict[str, Any]:
+        body: IngestUnitInput = {"type": type, "pool": pool, "payload": dict(payload)}
+        if scrubber_text is not None and self.scrubber_secret:
+            scrubber_base = (self.scrubber_url or "").rstrip("/")
+            if not scrubber_base:
+                raise ValueError("scrubber_url is required when scrubber_text is provided with scrubber_secret")
+            scrub = self._client.post(
+                f"{scrubber_base}/v1/scrub",
+                headers={"Content-Type": "application/json"},
+                content=json.dumps({"text": scrubber_text}, separators=(",", ":")).encode("utf-8"),
+            )
+            scrub_payload = _json_or_raw(scrub)
+            if not (200 <= scrub.status_code < 300):
+                parse_error_response(scrub.status_code, scrub_payload, scrub.text)
+            scrubbed = scrub_payload.get("scrubbed") if isinstance(scrub_payload, dict) else None
+            if isinstance(scrubbed, str):
+                body["payload"]["scrubber_text"] = scrubbed
+
+        raw_for_att = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        att = self._scrubber_attestation(hashlib.sha256(raw_for_att).hexdigest())
+        return self._operator_post("/api/units/ingest", cast(dict[str, Any], body), attestation=att)
+
+    def ingest_trace(self, source_agent: str, blob: dict[str, Any], *, trace_id: str | None = None) -> dict[str, Any]:
+        body: IngestTraceInput = {"source_agent": source_agent, "blob": blob}
         if trace_id:
             body["trace_id"] = trace_id
-        data = self._signed_request("POST", "/api/v1/traces", data=body)
-        return TraceResult.from_json(data, self.base_url)
+        raw_for_att = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        att = self._scrubber_attestation(hashlib.sha256(raw_for_att).hexdigest())
+        return self._operator_post("/api/v1/traces", cast(dict[str, Any], body), attestation=att)
 
-    def ingest_trace_and_wait(self, *, source_agent: str, blob: Mapping[str, Any], trace_id: str | None = None, max_wait_seconds: float = 60.0, poll_interval_seconds: float = 1.5) -> dict[str, Any]:
-        """Ingest a trace and poll until completed or timeout."""
-        result = self.ingest_trace(source_agent=source_agent, blob=blob, trace_id=trace_id)
-        if result.status != "pending":
-            return {"status": result.status, "trace_id": result.trace_id, "unit_ids": result.unit_ids}
-        deadline = time.time() + max_wait_seconds
-        while time.time() < deadline:
-            polled = self.fetch_trace(result.trace_id)
-            status = str(polled.get("status", ""))
-            if status and status != "pending":
-                return polled
-            blocking_sleep(poll_interval_seconds)
-        raise TimeoutError("trace polling timed out")
-
-    def fetch_trace(self, trace_id: str) -> dict[str, Any]:
-        """Fetch trace status by trace ID."""
+    def get_trace(self, trace_id: str) -> TraceStatus:
         response = self._client.get(f"{self.base_url}/api/v1/traces/{trace_id}")
         payload = _json_or_raw(response)
         if not (200 <= response.status_code < 300):
             parse_error_response(response.status_code, payload, response.text)
         return payload
 
-    def ingest_units(self, units: list[dict[str, Any]] | dict[str, Any]) -> dict[str, Any]:
-        """Ingest one or many units using /api/units/ingest."""
-        return self._signed_request("POST", "/api/units/ingest", data={"units": units} if isinstance(units, list) else units)
-
-    def score_unit(self, *, ref: str | None = None, unit_id: str | None = None) -> dict[str, Any]:
-        """Lookup aggregate score by external ref or unit ID."""
-        params: dict[str, str] = {}
-        if ref is not None:
-            params["ref"] = ref
-        if unit_id is not None:
-            params["id"] = unit_id
-        return self._signed_request("GET", "/api/units/score", params=params)
-
-    def skill_review(
+    def submit_judgment(
         self,
         *,
-        skill_name: str,
-        diff: str,
-        external_ref: str | None = None,
-        context: str | None = None,
-        source_agent: str | None = None,
-        yes_label: str | None = None,
-        no_label: str | None = None,
-        trusted_pool_only: bool | None = None,
+        unit_id: str,
+        rater_id: str,
+        choice: str,
+        latency_ms: int,
+        confidence: float | None = None,
+        behavioral: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Call skill review convenience endpoint."""
-        payload: dict[str, Any] = {"skill_name": skill_name, "diff": diff}
-        for key, value in {
-            "external_ref": external_ref,
-            "context": context,
-            "source_agent": source_agent,
-            "yes_label": yes_label,
-            "no_label": no_label,
-            "trusted_pool_only": trusted_pool_only,
-        }.items():
-            if value is not None:
-                payload[key] = value
-        return self._signed_request("POST", "/api/v1/skill-review", data=payload)
+        body: dict[str, Any] = {
+            "unit_id": unit_id,
+            "rater_id": rater_id,
+            "choice": choice,
+            "latency_ms": latency_ms,
+        }
+        if confidence is not None:
+            body["confidence"] = confidence
+        if behavioral is not None:
+            body["behavioral"] = behavioral
+        return self._operator_post("/api/judgments", body)
 
     def verify_token(self, token: str) -> VerifyResult:
-        """Verify a widget token. Public API signature intentionally unchanged."""
         response = self._client.post(
-            f"{self.base_url}/v1/verify",
+            f"{self.base_url}/api/verify",
             headers={"content-type": "application/json"},
-            json={"token": token, "site_key": self.site_key},
+            json={"token": token},
         )
         payload = _json_or_raw(response)
         if not (200 <= response.status_code < 300):
@@ -194,170 +149,136 @@ class PanelClient:
 
 
 class AsyncPanelClient:
-    """Asynchronous operator client for panel API."""
-
     def __init__(
         self,
         *,
         base_url: str,
         site_key: str,
         site_secret: str,
-        site_secret_source: str = "env",
-        scrubber_mode: str = "off",
         scrubber_secret: str | None = None,
         scrubber_url: str | None = None,
-        engine_version: str = "0.2.0",
         timeout_seconds: float = 10.0,
-        max_retries: int = 3,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        """Initialize AsyncPanelClient with server-sync options."""
         self.base_url = base_url.rstrip("/")
         self.site_key = site_key
         self.site_secret = site_secret
-        self.site_secret_source = site_secret_source
-        self.scrubber_mode = scrubber_mode
         self.scrubber_secret = scrubber_secret
         self.scrubber_url = scrubber_url
-        self.engine_version = engine_version
-        self.timeout_seconds = timeout_seconds
-        self.max_retries = max_retries
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
 
-    async def _signed_request(self, method: str, path: str, *, data: Any | None = None, params: dict[str, str] | None = None) -> Any:
-        body_obj = data if data is not None else {}
-        body = canonical_json(body_obj)
-        body, scrubber_headers = await build_scrubber_headers_async(
-            mode=self.scrubber_mode,
-            body=body,
-            engine_version=self.engine_version,
-            scrubber_secret=self.scrubber_secret,
-            scrubber_url=self.scrubber_url,
-            client=self._client,
-            timeout_seconds=self.timeout_seconds,
-        )
+    def _sign_hmac(self, raw_body: bytes) -> str:
+        return hmac.new(self.site_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
 
-        signature = hmac_sha256_hex(self.site_secret, body)
-        if method.upper() == "GET" and path == "/api/units/score":
-            signature = hmac_sha256_hex(
-                self.site_secret,
-                canonical_score_string(self.site_key, ref=params.get("ref") if params else None, unit_id=params.get("id") if params else None),
-            )
-
-        headers: dict[str, str] = {
-            "content-type": "application/json",
-            "x-panel-site-key": self.site_key,
-            "x-panel-ingest-sig": signature,
-            **scrubber_headers,
+    def _scrubber_attestation(self, output_hash_hex: str) -> str | None:
+        if not self.scrubber_secret:
+            return None
+        now = int(time.time())
+        payload = {
+            "output_hash": output_hash_hex,
+            "iat": now,
+            "exp": now + 60,
+            "jti": secrets.token_hex(16),
         }
-        if self.site_secret_source == "raw":
-            headers["x-panel-ingest-secret"] = self.site_secret
+        return jwt_hs256(self.scrubber_secret, payload)
 
-        attempt = 0
-        while True:
-            response = await self._client.request(
-                method,
-                f"{self.base_url}{path}",
-                headers=headers,
-                content=body if method.upper() != "GET" else None,
-                params=params,
-            )
-            payload = _json_or_raw(response)
-            if 200 <= response.status_code < 300:
-                return payload
-            retry_after_s: float | None = None
-            if response.status_code == 429:
-                ra = response.headers.get("Retry-After")
-                if ra:
-                    try:
-                        retry_after_s = float(ra)
-                    except ValueError:
-                        retry_after_s = None
-                if isinstance(payload, dict) and payload.get("retry_after_s") is not None:
-                    retry_after_s = float(payload["retry_after_s"])
-            if should_retry(response.status_code, attempt, self.max_retries):
-                await asyncio.sleep(retry_delay_seconds(response.status_code, attempt, retry_after_s))
-                attempt += 1
-                continue
+    async def _operator_post(self, path: str, body: dict[str, Any], *, attestation: str | None = None) -> dict[str, Any]:
+        raw_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "X-Panel-Site-Key": self.site_key,
+            "X-Panel-Ingest-Sig": self._sign_hmac(raw_body),
+        }
+        if attestation:
+            headers["X-Scrubber-Attestation"] = attestation
+        response = await self._client.post(f"{self.base_url}{path}", headers=headers, content=raw_body)
+        payload = _json_or_raw(response)
+        if not (200 <= response.status_code < 300):
             parse_error_response(response.status_code, payload, response.text)
+        return payload
 
-    async def ingest_trace(self, *, source_agent: str, blob: Mapping[str, Any], trace_id: str | None = None) -> TraceResult:
-        """Ingest a trace payload and return done/pending typed result."""
-        body: dict[str, Any] = {"source_agent": source_agent, "blob": blob}
+    async def ingest_unit(
+        self,
+        type: str,
+        payload: dict[str, Any],
+        *,
+        pool: str = "public",
+        scrubber_text: str | None = None,
+    ) -> dict[str, Any]:
+        body: IngestUnitInput = {"type": type, "pool": pool, "payload": dict(payload)}
+        if scrubber_text is not None and self.scrubber_secret:
+            scrubber_base = (self.scrubber_url or "").rstrip("/")
+            if not scrubber_base:
+                raise ValueError("scrubber_url is required when scrubber_text is provided with scrubber_secret")
+            scrub = await self._client.post(
+                f"{scrubber_base}/v1/scrub",
+                headers={"Content-Type": "application/json"},
+                content=json.dumps({"text": scrubber_text}, separators=(",", ":")).encode("utf-8"),
+            )
+            scrub_payload = _json_or_raw(scrub)
+            if not (200 <= scrub.status_code < 300):
+                parse_error_response(scrub.status_code, scrub_payload, scrub.text)
+            scrubbed = scrub_payload.get("scrubbed") if isinstance(scrub_payload, dict) else None
+            if isinstance(scrubbed, str):
+                body["payload"]["scrubber_text"] = scrubbed
+
+        raw_for_att = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        att = self._scrubber_attestation(hashlib.sha256(raw_for_att).hexdigest())
+        return await self._operator_post("/api/units/ingest", cast(dict[str, Any], body), attestation=att)
+
+    async def ingest_trace(self, source_agent: str, blob: dict[str, Any], *, trace_id: str | None = None) -> dict[str, Any]:
+        body: IngestTraceInput = {"source_agent": source_agent, "blob": blob}
         if trace_id:
             body["trace_id"] = trace_id
-        data = await self._signed_request("POST", "/api/v1/traces", data=body)
-        return TraceResult.from_json(data, self.base_url)
+        raw_for_att = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        att = self._scrubber_attestation(hashlib.sha256(raw_for_att).hexdigest())
+        return await self._operator_post("/api/v1/traces", cast(dict[str, Any], body), attestation=att)
 
-    async def ingest_trace_and_wait(self, *, source_agent: str, blob: Mapping[str, Any], trace_id: str | None = None, max_wait_seconds: float = 60.0, poll_interval_seconds: float = 1.5) -> dict[str, Any]:
-        """Ingest a trace and poll until completed or timeout."""
-        result = await self.ingest_trace(source_agent=source_agent, blob=blob, trace_id=trace_id)
-        if result.status != "pending":
-            return {"status": result.status, "trace_id": result.trace_id, "unit_ids": result.unit_ids}
-        deadline = time.time() + max_wait_seconds
-        while time.time() < deadline:
-            polled = await self.fetch_trace(result.trace_id)
-            status = str(polled.get("status", ""))
-            if status and status != "pending":
-                return polled
-            await asyncio.sleep(poll_interval_seconds)
-        raise TimeoutError("trace polling timed out")
-
-    async def fetch_trace(self, trace_id: str) -> dict[str, Any]:
-        """Fetch trace status by trace ID."""
+    async def get_trace(self, trace_id: str) -> TraceStatus:
         response = await self._client.get(f"{self.base_url}/api/v1/traces/{trace_id}")
         payload = _json_or_raw(response)
         if not (200 <= response.status_code < 300):
             parse_error_response(response.status_code, payload, response.text)
         return payload
 
-    async def ingest_units(self, units: list[dict[str, Any]] | dict[str, Any]) -> dict[str, Any]:
-        """Ingest one or many units using /api/units/ingest."""
-        return await self._signed_request("POST", "/api/units/ingest", data={"units": units} if isinstance(units, list) else units)
-
-    async def score_unit(self, *, ref: str | None = None, unit_id: str | None = None) -> dict[str, Any]:
-        """Lookup aggregate score by external ref or unit ID."""
-        params: dict[str, str] = {}
-        if ref is not None:
-            params["ref"] = ref
-        if unit_id is not None:
-            params["id"] = unit_id
-        return await self._signed_request("GET", "/api/units/score", params=params)
-
-    async def skill_review(
+    async def submit_judgment(
         self,
         *,
-        skill_name: str,
-        diff: str,
-        external_ref: str | None = None,
-        context: str | None = None,
-        source_agent: str | None = None,
-        yes_label: str | None = None,
-        no_label: str | None = None,
-        trusted_pool_only: bool | None = None,
+        unit_id: str,
+        rater_id: str,
+        choice: str,
+        latency_ms: int,
+        confidence: float | None = None,
+        behavioral: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Call skill review convenience endpoint."""
-        payload: dict[str, Any] = {"skill_name": skill_name, "diff": diff}
-        for key, value in {
-            "external_ref": external_ref,
-            "context": context,
-            "source_agent": source_agent,
-            "yes_label": yes_label,
-            "no_label": no_label,
-            "trusted_pool_only": trusted_pool_only,
-        }.items():
-            if value is not None:
-                payload[key] = value
-        return await self._signed_request("POST", "/api/v1/skill-review", data=payload)
+        body: dict[str, Any] = {
+            "unit_id": unit_id,
+            "rater_id": rater_id,
+            "choice": choice,
+            "latency_ms": latency_ms,
+        }
+        if confidence is not None:
+            body["confidence"] = confidence
+        if behavioral is not None:
+            body["behavioral"] = behavioral
+        return await self._operator_post("/api/judgments", body)
 
     async def verify_token(self, token: str) -> VerifyResult:
-        """Verify a widget token. Public API signature intentionally unchanged."""
         response = await self._client.post(
-            f"{self.base_url}/v1/verify",
+            f"{self.base_url}/api/verify",
             headers={"content-type": "application/json"},
-            json={"token": token, "site_key": self.site_key},
+            json={"token": token},
         )
         payload = _json_or_raw(response)
         if not (200 <= response.status_code < 300):
             parse_error_response(response.status_code, payload, response.text)
         return VerifyResult.from_json(payload)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def __aenter__(self) -> "AsyncPanelClient":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.aclose()
