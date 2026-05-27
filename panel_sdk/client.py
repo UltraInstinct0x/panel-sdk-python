@@ -105,9 +105,7 @@ class PanelClient:
         body: IngestTraceInput = {"source_agent": source_agent, "blob": blob}
         if trace_id:
             body["trace_id"] = trace_id
-        raw_for_att = json.dumps(body, separators=(",", ":")).encode("utf-8")
-        att = self._scrubber_attestation(hashlib.sha256(raw_for_att).hexdigest())
-        return self._operator_post("/api/v1/traces", cast(dict[str, Any], body), attestation=att)
+        return self._operator_post("/api/v1/traces", cast(dict[str, Any], body), attestation=None)
 
     def get_trace(self, trace_id: str) -> TraceStatus:
         response = self._client.get(f"{self.base_url}/api/v1/traces/{trace_id}")
@@ -234,9 +232,7 @@ class AsyncPanelClient:
         body: IngestTraceInput = {"source_agent": source_agent, "blob": blob}
         if trace_id:
             body["trace_id"] = trace_id
-        raw_for_att = json.dumps(body, separators=(",", ":")).encode("utf-8")
-        att = self._scrubber_attestation(hashlib.sha256(raw_for_att).hexdigest())
-        return await self._operator_post("/api/v1/traces", cast(dict[str, Any], body), attestation=att)
+        return await self._operator_post("/api/v1/traces", cast(dict[str, Any], body), attestation=None)
 
     async def get_trace(self, trace_id: str) -> TraceStatus:
         response = await self._client.get(f"{self.base_url}/api/v1/traces/{trace_id}")
