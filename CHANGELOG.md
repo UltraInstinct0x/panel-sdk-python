@@ -1,21 +1,15 @@
 # Changelog
 
-## v0.2.0 — server sync
+## v0.2.0 — panel server sync
 
-- Refactored package into modular files:
-  - `panel_sdk/client.py`
-  - `panel_sdk/rater.py`
-  - `panel_sdk/_signing.py`
-  - `panel_sdk/_scrubber.py`
-  - `panel_sdk/_retry.py`
-  - `panel_sdk/errors.py`
-  - `panel_sdk/types.py`
-- Added operator-side methods: `ingest_units`, `score_unit`, `skill_review`, `ingest_trace_and_wait`
-- Added typed trace ingest results (`TraceResult`) for sync/pending responses
-- Added dual-secret support with `site_secret_source="raw"` and `x-panel-ingest-secret`
-- Added scrubber dispatch modes: `off`, `self-sign`, `proxy`
-- Added typed errors: `PanelRateLimitError`, `PanelScrubberError`
-- Added rater clients: `RaterClient`, `AsyncRaterClient`
-- Added 429/5xx retry and backoff behavior
-- Added unit tests covering HMAC signing, scrubber JWT, async trace polling, and 429 retry
-- Kept `verify_token(token)` public signature unchanged
+- Added operator ingest methods on sync + async clients:
+  - `ingest_unit(type, payload, *, pool="public", scrubber_text=None)`
+  - `ingest_trace(source_agent, blob, *, trace_id=None)`
+  - `get_trace(trace_id)`
+  - `submit_judgment(...)`
+- Aligned verify path to `POST /api/verify`.
+- Implemented exact-byte HMAC signing (`X-Panel-Ingest-Sig`) for operator posts.
+- Added optional scrubber proxy call (`POST /v1/scrub`) and HS256 self-signed `X-Scrubber-Attestation` when scrubber text is explicitly provided.
+- Added typed inputs/status exports: `IngestUnitInput`, `IngestTraceInput`, `TraceStatus`.
+- Updated README with full sync + async usage examples.
+- Updated pytest coverage for HMAC exact-byte signing, scrubber attestation flow, trace ingest/poll, judgments, and async parity.

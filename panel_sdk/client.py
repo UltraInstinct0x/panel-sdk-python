@@ -95,8 +95,10 @@ class PanelClient:
             if isinstance(scrubbed, str):
                 body["payload"]["scrubber_text"] = scrubbed
 
-        raw_for_att = json.dumps(body, separators=(",", ":")).encode("utf-8")
-        att = self._scrubber_attestation(hashlib.sha256(raw_for_att).hexdigest())
+        att: str | None = None
+        if scrubber_text is not None and self.scrubber_secret:
+            raw_for_att = json.dumps(body, separators=(",", ":")).encode("utf-8")
+            att = self._scrubber_attestation(hashlib.sha256(raw_for_att).hexdigest())
         return self._operator_post("/api/units/ingest", cast(dict[str, Any], body), attestation=att)
 
     def ingest_trace(self, source_agent: str, blob: dict[str, Any], *, trace_id: str | None = None) -> dict[str, Any]:
@@ -222,8 +224,10 @@ class AsyncPanelClient:
             if isinstance(scrubbed, str):
                 body["payload"]["scrubber_text"] = scrubbed
 
-        raw_for_att = json.dumps(body, separators=(",", ":")).encode("utf-8")
-        att = self._scrubber_attestation(hashlib.sha256(raw_for_att).hexdigest())
+        att: str | None = None
+        if scrubber_text is not None and self.scrubber_secret:
+            raw_for_att = json.dumps(body, separators=(",", ":")).encode("utf-8")
+            att = self._scrubber_attestation(hashlib.sha256(raw_for_att).hexdigest())
         return await self._operator_post("/api/units/ingest", cast(dict[str, Any], body), attestation=att)
 
     async def ingest_trace(self, source_agent: str, blob: dict[str, Any], *, trace_id: str | None = None) -> dict[str, Any]:

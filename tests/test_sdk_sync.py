@@ -92,6 +92,27 @@ def test_submit_judgment_posts_expected_shape() -> None:
     assert body["confidence"] == 0.8
 
 
+
+
+@respx.mock
+def test_ingest_unit_without_scrubber_text_has_no_attestation() -> None:
+    seen: dict[str, str | None] = {}
+
+    def ingest_handler(request: httpx.Request) -> httpx.Response:
+        seen["att"] = request.headers.get("x-scrubber-attestation")
+        return httpx.Response(200, json={"id": "u_3"})
+
+    respx.post(f"{BASE}/api/units/ingest").mock(side_effect=ingest_handler)
+    client = PanelClient(
+        base_url=BASE,
+        site_key=SITE_KEY,
+        site_secret=SITE_SECRET,
+        scrubber_secret=SCRUBBER_SECRET,
+        scrubber_url="https://s.test",
+    )
+    out = client.ingest_unit("process_output_rating", {"passage": "x"})
+    assert out["id"] == "u_3"
+    assert seen["att"] is None
 @respx.mock
 @pytest.mark.asyncio
 async def test_async_methods_parity() -> None:
